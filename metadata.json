@@ -1,0 +1,6 @@
+{
+  "name": "Staff Control CRM",
+  "description": "Современная CRM-система для учёта рабочего времени, перерывов и активности сотрудников для заместителя руководителя Айгерим.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

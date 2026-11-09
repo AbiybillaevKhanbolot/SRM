@@ -1,0 +1,143 @@
+{
+  "entities": {
+    "Employee": {
+      "title": "Employee",
+      "description": "Сотрудник организации для учёта рабочего времени и звонков",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "is_active": { "type": "boolean" },
+        "position": { "type": "string" },
+        "created_at": { "type": "string" }
+      },
+      "required": ["id", "name", "is_active", "created_at"]
+    },
+    "Attendance": {
+      "title": "Attendance",
+      "description": "Ежедневная отметка прихода и ухода сотрудника",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "employee_id": { "type": "string" },
+        "date": { "type": "string" },
+        "arrival_time": { "type": "string" },
+        "departure_time": { "type": "string" },
+        "lateness_minutes": { "type": "number" },
+        "status": { "type": "string", "enum": ["on_time", "late", "absent"] },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["id", "employee_id", "date", "status"]
+    },
+    "Lunch": {
+      "title": "Lunch",
+      "description": "Учёт обеденных перерывов сотрудника",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "employee_id": { "type": "string" },
+        "date": { "type": "string" },
+        "lunch_start": { "type": "string" },
+        "planned_return": { "type": "string" },
+        "actual_return": { "type": "string" },
+        "duration_minutes": { "type": "number" },
+        "lateness_minutes": { "type": "number" },
+        "status": { "type": "string", "enum": ["on_time", "overdue", "in_progress"] },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["id", "employee_id", "date", "lunch_start", "status"]
+    },
+    "Break": {
+      "title": "Break",
+      "description": "Учёт времени отдыха и коротких пауз сотрудника",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "employee_id": { "type": "string" },
+        "date": { "type": "string" },
+        "break_start": { "type": "string" },
+        "break_end": { "type": "string" },
+        "duration_minutes": { "type": "number" },
+        "status": { "type": "string", "enum": ["in_progress", "completed"] },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["id", "employee_id", "date", "break_start", "status"]
+    },
+    "Call": {
+      "title": "Call",
+      "description": "Статистика принятых и пропущенных звонков сотрудника",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "employee_id": { "type": "string" },
+        "date": { "type": "string" },
+        "accepted_calls": { "type": "number" },
+        "missed_calls": { "type": "number" },
+        "total_calls": { "type": "number" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["id", "employee_id", "date", "accepted_calls", "missed_calls", "total_calls"]
+    },
+    "User": {
+      "title": "User",
+      "description": "Пользователь системы Staff Control CRM",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "username": { "type": "string" },
+        "employee_name": { "type": "string" },
+        "position": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "manager", "viewer"] },
+        "password_hash": { "type": "string" },
+        "created_at": { "type": "string" }
+      },
+      "required": ["id", "username", "employee_name", "position", "role"]
+    },
+    "Settings": {
+      "title": "Settings",
+      "description": "Общие настройки графика работы и перерывов CRM",
+      "type": "object",
+      "properties": {
+        "work_start": { "type": "string" },
+        "work_end": { "type": "string" },
+        "standard_lunch_minutes": { "type": "number" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["work_start", "work_end", "standard_lunch_minutes"]
+    }
+  },
+  "firestore": {
+    "/employees/{employeeId}": {
+      "schema": "Employee",
+      "description": "Коллекция сотрудников"
+    },
+    "/attendance/{attendanceId}": {
+      "schema": "Attendance",
+      "description": "Коллекция ежедневного прихода и ухода"
+    },
+    "/lunch/{lunchId}": {
+      "schema": "Lunch",
+      "description": "Коллекция обеденных перерывов"
+    },
+    "/breaks/{breakId}": {
+      "schema": "Break",
+      "description": "Коллекция перерывов на отдых"
+    },
+    "/calls/{callId}": {
+      "schema": "Call",
+      "description": "Коллекция статистики телефонных звонков"
+    },
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Коллекция пользователей CRM"
+    },
+    "/settings/{settingId}": {
+      "schema": "Settings",
+      "description": "Настройки рабочего времени"
+    }
+  }
+}
