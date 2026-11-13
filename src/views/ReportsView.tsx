@@ -30,44 +30,61 @@ export const ReportsView: React.FC = () => {
     addToast 
   } = useCrm();
 
+  const [dateScope, setDateScope] = useState<'selected' | 'all'>('selected');
   const [filterEmployeeId, setFilterEmployeeId] = useState<string>('all');
   const [filterSection, setFilterSection] = useState<ReportSection>('all');
   const [filterStatus, setFilterStatus] = useState<string>('all');
 
   const employeeMap = new Map(employees.map((e) => [e.id, e.name]));
 
-  const currentAttendance = attendance.filter((a) => {
-    const matchDate = a.date === selectedDate;
-    const matchEmp = filterEmployeeId === 'all' || a.employee_id === filterEmployeeId;
-    const matchStatus = filterStatus === 'all' || a.status === filterStatus;
-    return matchDate && matchEmp && matchStatus;
-  });
+  const sortByDateDesc = <T extends { date: string; updated_at?: string }>(items: T[]): T[] =>
+    [...items].sort((a, b) => {
+      const d = b.date.localeCompare(a.date);
+      if (d !== 0) return d;
+      return (b.updated_at || '').localeCompare(a.updated_at || '');
+    });
 
-  const currentLunch = lunch.filter((l) => {
-    const matchDate = l.date === selectedDate;
-    const matchEmp = filterEmployeeId === 'all' || l.employee_id === filterEmployeeId;
-    const matchStatus = filterStatus === 'all' || l.status === filterStatus;
-    return matchDate && matchEmp && matchStatus;
-  });
+  const currentAttendance = sortByDateDesc(
+    attendance.filter((a) => {
+      const matchDate = dateScope === 'all' || a.date === selectedDate;
+      const matchEmp = filterEmployeeId === 'all' || a.employee_id === filterEmployeeId;
+      const matchStatus = filterStatus === 'all' || a.status === filterStatus;
+      return matchDate && matchEmp && matchStatus;
+    })
+  );
 
-  const currentBreaks = breaks.filter((b) => {
-    const matchDate = b.date === selectedDate;
-    const matchEmp = filterEmployeeId === 'all' || b.employee_id === filterEmployeeId;
-    const matchStatus = filterStatus === 'all' || b.status === filterStatus;
-    return matchDate && matchEmp && matchStatus;
-  });
+  const currentLunch = sortByDateDesc(
+    lunch.filter((l) => {
+      const matchDate = dateScope === 'all' || l.date === selectedDate;
+      const matchEmp = filterEmployeeId === 'all' || l.employee_id === filterEmployeeId;
+      const matchStatus = filterStatus === 'all' || l.status === filterStatus;
+      return matchDate && matchEmp && matchStatus;
+    })
+  );
 
-  const currentCalls = calls.filter((c) => {
-    const matchDate = c.date === selectedDate;
-    const matchEmp = filterEmployeeId === 'all' || c.employee_id === filterEmployeeId;
-    return matchDate && matchEmp;
-  });
+  const currentBreaks = sortByDateDesc(
+    breaks.filter((b) => {
+      const matchDate = dateScope === 'all' || b.date === selectedDate;
+      const matchEmp = filterEmployeeId === 'all' || b.employee_id === filterEmployeeId;
+      const matchStatus = filterStatus === 'all' || b.status === filterStatus;
+      return matchDate && matchEmp && matchStatus;
+    })
+  );
+
+  const currentCalls = sortByDateDesc(
+    calls.filter((c) => {
+      const matchDate = dateScope === 'all' || c.date === selectedDate;
+      const matchEmp = filterEmployeeId === 'all' || c.employee_id === filterEmployeeId;
+      return matchDate && matchEmp;
+    })
+  );
 
   const handleExportExcel = () => {
     try {
+      const scopeLabel = dateScope === 'all' ? 'Все даты' : selectedDate;
       const rows: string[][] = [
-        ['Staff Control CRM — Сводный отчёт за ' + selectedDate],
-        ['Дата отчёта:', selectedDate, formatRussianDate(selectedDate)],
+        ['Staff Control CRM — Сводный отчёт (' + scopeLabel + ')'],
+        ['Период отчёта:', scopeLabel, dateScope === 'all' ? 'Полная история базы' : formatRussianDate(selectedDate)],
         ['Стандарт графика:', `Приход: ${settings.work_start}`, `Уход: ${settings.work_end}`, `Обед: ${settings.standard_lunch_minutes}м`],
         [],
         ['--- 1. ПРИХОД И УХОД ---'],
@@ -140,7 +157,7 @@ export const ReportsView: React.FC = () => {
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.setAttribute('href', url);
-      link.setAttribute('download', `Staff_Control_Report_${selectedDate}.csv`);
+      link.setAttribute('download', `Staff_Control_Report_${dateScope === 'all' ? 'ALL_HISTORY' : selectedDate}.csv`);
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -166,19 +183,19 @@ export const ReportsView: React.FC = () => {
               Экспорт и аналитика
             </span>
             <span className="text-xs font-semibold text-slate-500 font-mono">
-              {formatRussianDate(selectedDate)}
+              {dateScope === 'all' ? 'Полная история за все дни' : formatRussianDate(selectedDate)}
             </span>
           </div>
           <h2 className="text-xl md:text-2xl font-extrabold text-slate-900 tracking-tight">
             История активности и отчёты
           </h2>
           <p className="text-xs text-slate-400 mt-1 max-w-xl">
-            Сводные данные по всем 17 сотрудникам за выбранную дату: приход, опоздания, обеды, отдых и звонки.
+            Полная история по всем сотрудникам из базы Firestore: приход, опоздания, обеды, отдых и звонки.
           </p>
         </div>
 
         {/* Export Buttons */}
-        <div className="flex items-center gap-2.5 w-full md:w-auto">
+        <div className="flex items-center gap-2.5 w-full md:w-auto flex-wrap">
           <button
             type="button"
             onClick={handleExportExcel}
@@ -199,7 +216,34 @@ export const ReportsView: React.FC = () => {
       </div>
 
       {/* Filter Toolbar Bento */}
-      <div className="bento-card p-4 grid grid-cols-1 sm:grid-cols-4 gap-3.5">
+      <div className="bento-card p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3.5">
+        {/* Period Scope Selector */}
+        <div>
+          <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5">
+            Период
+          </label>
+          <div className="flex items-center p-1 bg-slate-100 rounded-2xl text-xs font-semibold">
+            <button
+              type="button"
+              onClick={() => setDateScope('selected')}
+              className={`flex-1 py-1.5 rounded-xl transition-all cursor-pointer ${
+                dateScope === 'selected' ? 'bg-white text-slate-900 shadow-2xs font-bold' : 'text-slate-500'
+              }`}
+            >
+              День
+            </button>
+            <button
+              type="button"
+              onClick={() => setDateScope('all')}
+              className={`flex-1 py-1.5 rounded-xl transition-all cursor-pointer ${
+                dateScope === 'all' ? 'bg-[#B9F74A] text-[#102407] shadow-2xs font-bold' : 'text-slate-500'
+              }`}
+            >
+              Вся история
+            </button>
+          </div>
+        </div>
+
         {/* Date Selector */}
         <div>
           <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5">
@@ -207,9 +251,10 @@ export const ReportsView: React.FC = () => {
           </label>
           <input
             type="date"
+            disabled={dateScope === 'all'}
             value={selectedDate}
             onChange={(e) => e.target.value && setSelectedDate(e.target.value)}
-            className="w-full px-3.5 py-2 rounded-2xl border border-slate-200 bg-slate-50/70 text-xs font-mono font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#A2EC24]/50 focus:bg-white transition-all"
+            className="w-full px-3.5 py-2 rounded-2xl border border-slate-200 bg-slate-50/70 text-xs font-mono font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#A2EC24]/50 focus:bg-white transition-all disabled:opacity-40"
           />
         </div>
 
@@ -283,6 +328,7 @@ export const ReportsView: React.FC = () => {
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50/30 text-[10px] text-slate-400 font-bold uppercase tracking-widest border-b border-slate-100/60">
                   <tr>
+                    <th className="py-3 px-5">Дата</th>
                     <th className="py-3 px-5">Сотрудник</th>
                     <th className="py-3 px-5">Приход</th>
                     <th className="py-3 px-5">Уход</th>
@@ -293,13 +339,14 @@ export const ReportsView: React.FC = () => {
                 <tbody className="divide-y divide-slate-100/60">
                   {currentAttendance.length === 0 ? (
                     <tr>
-                      <td colSpan={5} className="py-6 px-5 text-center text-slate-400 font-normal">
+                      <td colSpan={6} className="py-6 px-5 text-center text-slate-400 font-normal">
                         Нет записей прихода по выбранным фильтрам
                       </td>
                     </tr>
                   ) : (
                     currentAttendance.map((a) => (
                       <tr key={a.id} className="hover:bg-white/80">
+                        <td className="py-3 px-5 font-mono text-slate-500">{a.date}</td>
                         <td className="py-3 px-5 font-semibold text-slate-800">
                           {employeeMap.get(a.employee_id) || a.employee_id}
                         </td>
@@ -312,9 +359,11 @@ export const ReportsView: React.FC = () => {
                           <span className={`text-[11px] font-medium px-2.5 py-0.5 rounded-full border ${
                             a.status === 'on_time' 
                               ? 'bg-emerald-50/80 text-emerald-700 border-emerald-100/60' 
-                              : 'bg-amber-50/80 text-amber-700 border-amber-100/60'
+                              : a.status === 'late'
+                              ? 'bg-amber-50/80 text-amber-700 border-amber-100/60'
+                              : 'bg-slate-50 text-slate-500 border-slate-200/60'
                           }`}>
-                            {a.status === 'on_time' ? 'Вовремя' : `Опоздал (+${a.lateness_minutes}м)`}
+                            {a.status === 'on_time' ? 'Вовремя' : a.status === 'late' ? `Опоздал (+${a.lateness_minutes}м)` : 'Только уход'}
                           </span>
                         </td>
                       </tr>
@@ -341,6 +390,7 @@ export const ReportsView: React.FC = () => {
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50/30 text-[10px] text-slate-400 font-bold uppercase tracking-widest border-b border-slate-100/60">
                   <tr>
+                    <th className="py-3 px-5">Дата</th>
                     <th className="py-3 px-5">Сотрудник</th>
                     <th className="py-3 px-5">Уход</th>
                     <th className="py-3 px-5">План</th>
@@ -352,13 +402,14 @@ export const ReportsView: React.FC = () => {
                 <tbody className="divide-y divide-slate-100/60">
                   {currentLunch.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="py-6 px-5 text-center text-slate-400 font-normal">
+                      <td colSpan={7} className="py-6 px-5 text-center text-slate-400 font-normal">
                         Нет записей обеда по выбранным фильтрам
                       </td>
                     </tr>
                   ) : (
                     currentLunch.map((l) => (
                       <tr key={l.id} className="hover:bg-white/80">
+                        <td className="py-3 px-5 font-mono text-slate-500">{l.date}</td>
                         <td className="py-3 px-5 font-semibold text-slate-800">
                           {employeeMap.get(l.employee_id) || l.employee_id}
                         </td>
@@ -401,6 +452,7 @@ export const ReportsView: React.FC = () => {
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50/30 text-[10px] text-slate-400 font-bold uppercase tracking-widest border-b border-slate-100/60">
                   <tr>
+                    <th className="py-3 px-5">Дата</th>
                     <th className="py-3 px-5">Сотрудник</th>
                     <th className="py-3 px-5">Начало</th>
                     <th className="py-3 px-5">Окончание</th>
@@ -411,13 +463,14 @@ export const ReportsView: React.FC = () => {
                 <tbody className="divide-y divide-slate-100/60">
                   {currentBreaks.length === 0 ? (
                     <tr>
-                      <td colSpan={5} className="py-6 px-5 text-center text-slate-400 font-normal">
+                      <td colSpan={6} className="py-6 px-5 text-center text-slate-400 font-normal">
                         Нет записей отдыха по выбранным фильтрам
                       </td>
                     </tr>
                   ) : (
                     currentBreaks.map((b) => (
                       <tr key={b.id} className="hover:bg-white/80">
+                        <td className="py-3 px-5 font-mono text-slate-500">{b.date}</td>
                         <td className="py-3 px-5 font-semibold text-slate-800">
                           {employeeMap.get(b.employee_id) || b.employee_id}
                         </td>
@@ -457,6 +510,7 @@ export const ReportsView: React.FC = () => {
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50/30 text-[10px] text-slate-400 font-bold uppercase tracking-widest border-b border-slate-100/60">
                   <tr>
+                    <th className="py-3 px-5">Дата</th>
                     <th className="py-3 px-5">Сотрудник</th>
                     <th className="py-3 px-5">Принятые</th>
                     <th className="py-3 px-5">Пропущенные</th>
@@ -466,13 +520,14 @@ export const ReportsView: React.FC = () => {
                 <tbody className="divide-y divide-slate-100/60">
                   {currentCalls.length === 0 ? (
                     <tr>
-                      <td colSpan={4} className="py-6 px-5 text-center text-slate-400 font-normal">
+                      <td colSpan={5} className="py-6 px-5 text-center text-slate-400 font-normal">
                         Нет записей звонков по выбранным фильтрам
                       </td>
                     </tr>
                   ) : (
                     currentCalls.map((c) => (
                       <tr key={c.id} className="hover:bg-white/80">
+                        <td className="py-3 px-5 font-mono text-slate-500">{c.date}</td>
                         <td className="py-3 px-5 font-semibold text-slate-800">
                           {employeeMap.get(c.employee_id) || c.employee_id}
                         </td>

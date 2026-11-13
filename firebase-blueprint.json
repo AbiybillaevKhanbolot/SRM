@@ -24,7 +24,7 @@
         "arrival_time": { "type": "string" },
         "departure_time": { "type": "string" },
         "lateness_minutes": { "type": "number" },
-        "status": { "type": "string", "enum": ["on_time", "late", "absent"] },
+        "status": { "type": "string", "enum": ["on_time", "late", "absent", "not_marked"] },
         "created_at": { "type": "string" },
         "updated_at": { "type": "string" }
       },

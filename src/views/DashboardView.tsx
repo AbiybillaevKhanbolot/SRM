@@ -421,7 +421,7 @@ export const DashboardView: React.FC = () => {
             </button>
           </div>
 
-          {/* Top Highlighted Alert Card (like Asivest Subscriptions in mockup) */}
+          {/* Top Highlighted Alert Card */}
           <div className="p-3.5 rounded-2xl bg-orange-50/60 border border-orange-200/60 mb-4 flex items-center justify-between">
             <div className="min-w-0 pr-2">
               <div className="text-xs font-bold text-slate-900 truncate">
@@ -433,8 +433,9 @@ export const DashboardView: React.FC = () => {
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
               <button 
-                onClick={() => addToast('Отметка подтверждена', 'success')}
+                onClick={() => setActiveSection('attendance')}
                 className="w-7 h-7 rounded-full bg-[#B9F74A] text-[#122709] flex items-center justify-center font-bold shadow-2xs hover:scale-105 active:scale-95 transition-all"
+                title="Открыть Приход"
               >
                 <Check className="w-4 h-4 stroke-[2.5]" />
               </button>
@@ -447,46 +448,103 @@ export const DashboardView: React.FC = () => {
             </div>
           </div>
 
-          {/* Recent Event Items */}
+          {/* Recent Live Event Items from Firestore */}
           <div className="space-y-3 flex-1 overflow-hidden">
-            <div className="flex items-center justify-between text-xs py-1">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-full bg-indigo-50 text-indigo-600 flex items-center justify-center font-bold text-xs">
-                  Х
-                </div>
-                <div>
-                  <div className="font-bold text-slate-800">Хан</div>
-                  <div className="text-[10px] text-slate-400">Сегодня, 13:00</div>
-                </div>
-              </div>
-              <span className="font-mono text-emerald-600 font-bold text-xs">+45м обед</span>
-            </div>
+            {(() => {
+              const empMap = new Map(employees.map((e) => [e.id, e.name]));
+              const events: {
+                id: string;
+                name: string;
+                subtitle: string;
+                badge: string;
+                badgeClass: string;
+                avatarClass: string;
+                ts: string;
+              }[] = [];
 
-            <div className="flex items-center justify-between text-xs py-1">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-full bg-purple-50 text-purple-600 flex items-center justify-center font-bold text-xs">
-                  М
-                </div>
-                <div>
-                  <div className="font-bold text-slate-800">Малика</div>
-                  <div className="text-[10px] text-slate-400">Сегодня, 11:20</div>
-                </div>
-              </div>
-              <span className="font-mono text-slate-700 font-bold text-xs">15м отдых</span>
-            </div>
+              todayAttendance.forEach((a) => {
+                const name = empMap.get(a.employee_id) || 'Сотрудник';
+                if (a.arrival_time) {
+                  events.push({
+                    id: `ev_att_${a.id}`,
+                    name,
+                    subtitle: `Приход • ${a.arrival_time}${a.departure_time ? ` → ${a.departure_time}` : ''}`,
+                    badge: a.status === 'late' ? `+${a.lateness_minutes}м` : 'Вовремя',
+                    badgeClass: a.status === 'late' ? 'text-amber-600' : 'text-emerald-600',
+                    avatarClass: 'bg-indigo-50 text-indigo-600',
+                    ts: a.updated_at || a.created_at || '',
+                  });
+                }
+              });
 
-            <div className="flex items-center justify-between text-xs py-1">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold text-xs">
-                  А
+              todayLunch.forEach((l) => {
+                const name = empMap.get(l.employee_id) || 'Сотрудник';
+                events.push({
+                  id: `ev_lnc_${l.id}`,
+                  name,
+                  subtitle: `Обед • ${l.lunch_start}`,
+                  badge: l.status === 'in_progress' ? 'На обеде' : `${l.duration_minutes}м обед`,
+                  badgeClass: l.status === 'overdue' ? 'text-rose-600' : 'text-emerald-600',
+                  avatarClass: 'bg-amber-50 text-amber-600',
+                  ts: l.updated_at || l.created_at || '',
+                });
+              });
+
+              todayBreaks.forEach((b) => {
+                const name = empMap.get(b.employee_id) || 'Сотрудник';
+                events.push({
+                  id: `ev_brk_${b.id}`,
+                  name,
+                  subtitle: `Тайм • ${b.break_start}`,
+                  badge: b.status === 'in_progress' ? 'Отдых' : `${b.duration_minutes}м отдых`,
+                  badgeClass: 'text-slate-700',
+                  avatarClass: 'bg-purple-50 text-purple-600',
+                  ts: b.updated_at || b.created_at || '',
+                });
+              });
+
+              todayCalls.forEach((c) => {
+                if (c.total_calls > 0) {
+                  const name = empMap.get(c.employee_id) || 'Сотрудник';
+                  events.push({
+                    id: `ev_cal_${c.id}`,
+                    name,
+                    subtitle: `Звонки за ${c.date}`,
+                    badge: `+${c.accepted_calls} звонков`,
+                    badgeClass: 'text-emerald-600',
+                    avatarClass: 'bg-emerald-50 text-emerald-600',
+                    ts: c.updated_at || c.created_at || '',
+                  });
+                }
+              });
+
+              const sorted = events
+                .sort((a, b) => b.ts.localeCompare(a.ts))
+                .slice(0, 3);
+
+              if (sorted.length === 0) {
+                return (
+                  <div className="py-6 text-center text-xs text-slate-400">
+                    За {selectedDate} пока нет отмеченных событий
+                  </div>
+                );
+              }
+
+              return sorted.map((ev) => (
+                <div key={ev.id} className="flex items-center justify-between text-xs py-1">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs shrink-0 ${ev.avatarClass}`}>
+                      {ev.name[0] || 'С'}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-bold text-slate-800 truncate">{ev.name}</div>
+                      <div className="text-[10px] text-slate-400 truncate">{ev.subtitle}</div>
+                    </div>
+                  </div>
+                  <span className={`font-mono font-bold text-xs shrink-0 ml-2 ${ev.badgeClass}`}>{ev.badge}</span>
                 </div>
-                <div>
-                  <div className="font-bold text-slate-800">Айгуль</div>
-                  <div className="text-[10px] text-slate-400">Сегодня, 10:45</div>
-                </div>
-              </div>
-              <span className="font-mono text-emerald-600 font-bold text-xs">+45 звонков</span>
-            </div>
+              ));
+            })()}
           </div>
 
           <button

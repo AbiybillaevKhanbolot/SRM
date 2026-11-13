@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { 
   Employee, 
   AttendanceRecord, 
@@ -22,7 +22,19 @@ import {
   getTodayDateString 
 } from '../lib/calculations';
 import { getSavedSession, clearSession } from '../lib/auth';
-import { db, collection, doc, setDoc, deleteDoc, onSnapshot } from '../lib/firebase';
+import { 
+  db, 
+  collection, 
+  doc, 
+  getDoc,
+  setDoc, 
+  deleteDoc, 
+  onSnapshot,
+  sanitizeForFirestore,
+  handleFirestoreError,
+  OperationType,
+  testConnection
+} from '../lib/firebase';
 
 interface TimePickerConfig {
   isOpen: boolean;
@@ -44,6 +56,13 @@ interface ToastMessage {
   id: string;
   message: string;
   type: 'success' | 'error' | 'info';
+}
+
+interface PendingOp {
+  type: 'set' | 'delete';
+  col: 'employees' | 'attendance' | 'lunch' | 'breaks' | 'calls' | 'settings';
+  id: string;
+  data?: Record<string, unknown>;
 }
 
 interface CrmContextType {
@@ -99,6 +118,7 @@ interface CrmContextType {
 const CrmContext = createContext<CrmContextType | undefined>(undefined);
 
 const LOCAL_STORAGE_KEY = 'staff_control_crm_backup_v2';
+const PENDING_WRITES_KEY = 'staff_control_crm_pending_ops_v1';
 
 export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [session, setSession] = useState<UserSession | null>(() => getSavedSession());
@@ -115,6 +135,22 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [breaks, setBreaks] = useState<BreakRecord[]>([]);
   const [calls, setCalls] = useState<CallRecord[]>([]);
   const [settings, setSettings] = useState<SystemSettings>(DEFAULT_SETTINGS);
+
+  // Refs to prevent stale closures during rapid updates
+  const employeesRef = useRef<Employee[]>([]);
+  const attendanceRef = useRef<AttendanceRecord[]>([]);
+  const lunchRef = useRef<LunchRecord[]>([]);
+  const breaksRef = useRef<BreakRecord[]>([]);
+  const callsRef = useRef<CallRecord[]>([]);
+  const settingsRef = useRef<SystemSettings>(DEFAULT_SETTINGS);
+  const isSeedingRef = useRef<boolean>(false);
+
+  useEffect(() => { employeesRef.current = employees; }, [employees]);
+  useEffect(() => { attendanceRef.current = attendance; }, [attendance]);
+  useEffect(() => { lunchRef.current = lunch; }, [lunch]);
+  useEffect(() => { breaksRef.current = breaks; }, [breaks]);
+  useEffect(() => { callsRef.current = calls; }, [calls]);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
 
   // Wheel Time Picker State
   const [timePickerModal, setTimePickerModal] = useState<TimePickerConfig>({
@@ -165,7 +201,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setConfirmModal((prev) => ({ ...prev, isOpen: false }));
   }, []);
 
-  const saveToLocalBackup = (data: {
+  const saveToLocalBackup = useCallback((data: {
     employees?: Employee[];
     attendance?: AttendanceRecord[];
     lunch?: LunchRecord[];
@@ -181,7 +217,155 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } catch (e) {
       console.warn('Local backup failed', e);
     }
-  };
+  }, []);
+
+  // Pending offline write queue helpers
+  const loadPendingOps = useCallback((): PendingOp[] => {
+    try {
+      const raw = localStorage.getItem(PENDING_WRITES_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const savePendingOps = useCallback((ops: PendingOp[]) => {
+    try {
+      localStorage.setItem(PENDING_WRITES_KEY, JSON.stringify(ops));
+    } catch (e) {
+      console.warn('Failed to save pending ops', e);
+    }
+  }, []);
+
+  const enqueuePendingOp = useCallback((op: PendingOp) => {
+    const current = loadPendingOps();
+    const filtered = current.filter((item) => !(item.col === op.col && item.id === op.id));
+    savePendingOps([...filtered, op]);
+  }, [loadPendingOps, savePendingOps]);
+
+  const clearPendingOp = useCallback((col: PendingOp['col'], id: string) => {
+    const current = loadPendingOps();
+    const filtered = current.filter((item) => !(item.col === col && item.id === id));
+    if (filtered.length !== current.length) {
+      savePendingOps(filtered);
+    }
+  }, [loadPendingOps, savePendingOps]);
+
+  const flushPendingOps = useCallback(async () => {
+    const ops = loadPendingOps();
+    if (ops.length === 0) return;
+
+    const remaining: PendingOp[] = [];
+    for (const op of ops) {
+      try {
+        const docRef = doc(db, op.col, op.id);
+        if (op.type === 'set' && op.data) {
+          await setDoc(docRef, sanitizeForFirestore(op.data));
+        } else if (op.type === 'delete') {
+          await deleteDoc(docRef);
+        }
+      } catch (err) {
+        handleFirestoreError(err, op.type === 'set' ? OperationType.WRITE : OperationType.DELETE, `${op.col}/${op.id}`);
+        remaining.push(op);
+      }
+    }
+    savePendingOps(remaining);
+    if (remaining.length === 0) {
+      setCloudSyncStatus('synced');
+    }
+  }, [loadPendingOps, savePendingOps]);
+
+  // Merge cloud snapshot with any pending local ops so unsynced writes are never overwritten
+  const mergeWithPending = useCallback(<T extends { id: string }>(
+    col: PendingOp['col'],
+    cloudItems: T[]
+  ): T[] => {
+    const ops = loadPendingOps().filter((o) => o.col === col);
+    if (ops.length === 0) return cloudItems;
+
+    const map = new Map<string, T>(cloudItems.map((item) => [item.id, item]));
+    for (const op of ops) {
+      if (op.type === 'delete') {
+        map.delete(op.id);
+      } else if (op.type === 'set' && op.data) {
+        map.set(op.id, op.data as unknown as T);
+      }
+    }
+    return Array.from(map.values());
+  }, [loadPendingOps]);
+
+  // Write helper: always sanitizes undefined fields and tracks sync status
+  const writeDocSafe = useCallback(async <T extends Record<string, unknown>>(
+    col: PendingOp['col'],
+    id: string,
+    data: T
+  ): Promise<boolean> => {
+    const cleanData = sanitizeForFirestore(data);
+    try {
+      await setDoc(doc(db, col, id), cleanData);
+      clearPendingOp(col, id);
+      setCloudSyncStatus('synced');
+      return true;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `${col}/${id}`);
+      enqueuePendingOp({ type: 'set', col, id, data: cleanData });
+      setCloudSyncStatus('offline');
+      return false;
+    }
+  }, [clearPendingOp, enqueuePendingOp]);
+
+  const deleteDocSafe = useCallback(async (
+    col: PendingOp['col'],
+    id: string
+  ): Promise<boolean> => {
+    try {
+      await deleteDoc(doc(db, col, id));
+      clearPendingOp(col, id);
+      setCloudSyncStatus('synced');
+      return true;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `${col}/${id}`);
+      enqueuePendingOp({ type: 'delete', col, id });
+      setCloudSyncStatus('offline');
+      return false;
+    }
+  }, [clearPendingOp, enqueuePendingOp]);
+
+  const seedInitialEmployees = useCallback(async () => {
+    if (isSeedingRef.current) return;
+    isSeedingRef.current = true;
+
+    const list: Employee[] = INITIAL_EMPLOYEES.map((emp, index) => ({
+      id: `emp_${String(index + 1).padStart(3, '0')}`,
+      ...emp,
+    }));
+    setEmployees(list);
+    saveToLocalBackup({ employees: list });
+
+    try {
+      for (const emp of list) {
+        await setDoc(doc(db, 'employees', emp.id), sanitizeForFirestore(emp));
+      }
+      const settingsSnap = await getDoc(doc(db, 'settings', 'general'));
+      if (!settingsSnap.exists()) {
+        await setDoc(doc(db, 'settings', 'general'), sanitizeForFirestore(DEFAULT_SETTINGS));
+      }
+      setCloudSyncStatus('synced');
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, 'employees');
+    } finally {
+      isSeedingRef.current = false;
+    }
+  }, [saveToLocalBackup]);
+
+  const seedLocalEmployees = useCallback(() => {
+    const list: Employee[] = INITIAL_EMPLOYEES.map((emp, index) => ({
+      id: `emp_${String(index + 1).padStart(3, '0')}`,
+      ...emp,
+    }));
+    setEmployees(list);
+    saveToLocalBackup({ employees: list });
+  }, [saveToLocalBackup]);
 
   useEffect(() => {
     let unsubEmployees: (() => void) | undefined;
@@ -191,6 +375,11 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     let unsubCalls: (() => void) | undefined;
     let unsubSettings: (() => void) | undefined;
 
+    const handleOnline = () => {
+      flushPendingOps();
+    };
+    window.addEventListener('online', handleOnline);
+
     const initData = async () => {
       setIsLoading(true);
 
@@ -198,7 +387,9 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       try {
         const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
         if (raw) cachedBackup = JSON.parse(raw);
-      } catch {}
+      } catch {
+        // ignore invalid JSON
+      }
 
       if (cachedBackup) {
         if (cachedBackup.employees?.length) setEmployees(cachedBackup.employees);
@@ -209,66 +400,114 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (cachedBackup.settings) setSettings(cachedBackup.settings);
       }
 
+      // Test connection on boot per Firebase guidelines
+      const online = await testConnection();
+      if (online) {
+        await flushPendingOps();
+      }
+
       try {
-        unsubEmployees = onSnapshot(collection(db, 'employees'), (snapshot) => {
-          if (!snapshot.empty) {
-            const list: Employee[] = [];
-            snapshot.forEach((docSnap) => {
-              list.push(docSnap.data() as Employee);
-            });
-            list.sort((a, b) => a.created_at.localeCompare(b.created_at));
-            setEmployees(list);
-            saveToLocalBackup({ employees: list });
-          } else {
-            seedInitialEmployees();
-          }
-          setCloudSyncStatus('synced');
-        }, () => {
-          setCloudSyncStatus('offline');
-          if (!cachedBackup?.employees?.length) {
-            seedLocalEmployees();
-          }
-        });
-
-        unsubAttendance = onSnapshot(collection(db, 'attendance'), (snapshot) => {
-          const list: AttendanceRecord[] = [];
-          snapshot.forEach((d) => list.push(d.data() as AttendanceRecord));
-          setAttendance(list);
-          saveToLocalBackup({ attendance: list });
-        });
-
-        unsubLunch = onSnapshot(collection(db, 'lunch'), (snapshot) => {
-          const list: LunchRecord[] = [];
-          snapshot.forEach((d) => list.push(d.data() as LunchRecord));
-          setLunch(list);
-          saveToLocalBackup({ lunch: list });
-        });
-
-        unsubBreaks = onSnapshot(collection(db, 'breaks'), (snapshot) => {
-          const list: BreakRecord[] = [];
-          snapshot.forEach((d) => list.push(d.data() as BreakRecord));
-          setBreaks(list);
-          saveToLocalBackup({ breaks: list });
-        });
-
-        unsubCalls = onSnapshot(collection(db, 'calls'), (snapshot) => {
-          const list: CallRecord[] = [];
-          snapshot.forEach((d) => list.push(d.data() as CallRecord));
-          setCalls(list);
-          saveToLocalBackup({ calls: list });
-        });
-
-        unsubSettings = onSnapshot(collection(db, 'settings'), (snapshot) => {
-          snapshot.forEach((d) => {
-            if (d.id === 'general') {
-              const data = d.data() as SystemSettings;
-              setSettings(data);
-              saveToLocalBackup({ settings: data });
+        unsubEmployees = onSnapshot(
+          collection(db, 'employees'),
+          (snapshot) => {
+            if (!snapshot.empty) {
+              const rawList: Employee[] = [];
+              snapshot.forEach((docSnap) => {
+                rawList.push(docSnap.data() as Employee);
+              });
+              const merged = mergeWithPending('employees', rawList);
+              merged.sort((a, b) => a.created_at.localeCompare(b.created_at));
+              setEmployees(merged);
+              saveToLocalBackup({ employees: merged });
+            } else if (!snapshot.metadata.fromCache) {
+              seedInitialEmployees();
             }
-          });
-        });
+            setCloudSyncStatus('synced');
+          },
+          (error) => {
+            handleFirestoreError(error, OperationType.GET, 'employees');
+            setCloudSyncStatus('offline');
+            if (!cachedBackup?.employees?.length) {
+              seedLocalEmployees();
+            }
+          }
+        );
 
-      } catch {
+        unsubAttendance = onSnapshot(
+          collection(db, 'attendance'),
+          (snapshot) => {
+            const rawList: AttendanceRecord[] = [];
+            snapshot.forEach((d) => rawList.push(d.data() as AttendanceRecord));
+            const merged = mergeWithPending('attendance', rawList);
+            setAttendance(merged);
+            saveToLocalBackup({ attendance: merged });
+            setCloudSyncStatus('synced');
+          },
+          (error) => {
+            handleFirestoreError(error, OperationType.GET, 'attendance');
+            setCloudSyncStatus('offline');
+          }
+        );
+
+        unsubLunch = onSnapshot(
+          collection(db, 'lunch'),
+          (snapshot) => {
+            const rawList: LunchRecord[] = [];
+            snapshot.forEach((d) => rawList.push(d.data() as LunchRecord));
+            const merged = mergeWithPending('lunch', rawList);
+            setLunch(merged);
+            saveToLocalBackup({ lunch: merged });
+          },
+          (error) => {
+            handleFirestoreError(error, OperationType.GET, 'lunch');
+          }
+        );
+
+        unsubBreaks = onSnapshot(
+          collection(db, 'breaks'),
+          (snapshot) => {
+            const rawList: BreakRecord[] = [];
+            snapshot.forEach((d) => rawList.push(d.data() as BreakRecord));
+            const merged = mergeWithPending('breaks', rawList);
+            setBreaks(merged);
+            saveToLocalBackup({ breaks: merged });
+          },
+          (error) => {
+            handleFirestoreError(error, OperationType.GET, 'breaks');
+          }
+        );
+
+        unsubCalls = onSnapshot(
+          collection(db, 'calls'),
+          (snapshot) => {
+            const rawList: CallRecord[] = [];
+            snapshot.forEach((d) => rawList.push(d.data() as CallRecord));
+            const merged = mergeWithPending('calls', rawList);
+            setCalls(merged);
+            saveToLocalBackup({ calls: merged });
+          },
+          (error) => {
+            handleFirestoreError(error, OperationType.GET, 'calls');
+          }
+        );
+
+        unsubSettings = onSnapshot(
+          collection(db, 'settings'),
+          (snapshot) => {
+            snapshot.forEach((d) => {
+              if (d.id === 'general') {
+                const data = d.data() as SystemSettings;
+                setSettings(data);
+                saveToLocalBackup({ settings: data });
+              }
+            });
+          },
+          (error) => {
+            handleFirestoreError(error, OperationType.GET, 'settings');
+          }
+        );
+      } catch (err) {
+        handleFirestoreError(err, OperationType.GET, 'firestore_init');
         setCloudSyncStatus('offline');
         if (!cachedBackup?.employees?.length) {
           seedLocalEmployees();
@@ -281,6 +520,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     initData();
 
     return () => {
+      window.removeEventListener('online', handleOnline);
       unsubEmployees?.();
       unsubAttendance?.();
       unsubLunch?.();
@@ -288,34 +528,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       unsubCalls?.();
       unsubSettings?.();
     };
-  }, []);
-
-  const seedInitialEmployees = async () => {
-    const list: Employee[] = INITIAL_EMPLOYEES.map((emp, index) => ({
-      id: `emp_${String(index + 1).padStart(3, '0')}`,
-      ...emp,
-    }));
-    setEmployees(list);
-    saveToLocalBackup({ employees: list });
-
-    try {
-      for (const emp of list) {
-        await setDoc(doc(db, 'employees', emp.id), emp);
-      }
-      await setDoc(doc(db, 'settings', 'general'), DEFAULT_SETTINGS);
-    } catch (e) {
-      console.warn('Could not write initial seed to cloud', e);
-    }
-  };
-
-  const seedLocalEmployees = () => {
-    const list: Employee[] = INITIAL_EMPLOYEES.map((emp, index) => ({
-      id: `emp_${String(index + 1).padStart(3, '0')}`,
-      ...emp,
-    }));
-    setEmployees(list);
-    saveToLocalBackup({ employees: list });
-  };
+  }, [flushPendingOps, mergeWithPending, saveToLocalBackup, seedInitialEmployees, seedLocalEmployees]);
 
   const logout = () => {
     clearSession();
@@ -326,15 +539,15 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // ATTENDANCE ACTIONS
   const setArrivalTime = async (employeeId: string, date: string, time: string) => {
     const recordId = `att_${employeeId}_${date}`;
-    const existing = attendance.find((a) => a.employee_id === employeeId && a.date === date);
-    const { latenessMinutes, status } = calculateArrivalLateness(time, settings.work_start);
+    const existing = attendanceRef.current.find((a) => a.id === recordId || (a.employee_id === employeeId && a.date === date));
+    const { latenessMinutes, status } = calculateArrivalLateness(time, settingsRef.current.work_start);
 
     const record: AttendanceRecord = {
       id: recordId,
       employee_id: employeeId,
       date,
       arrival_time: time,
-      departure_time: existing?.departure_time,
+      ...(existing?.departure_time ? { departure_time: existing.departure_time } : {}),
       lateness_minutes: latenessMinutes,
       status,
       created_at: existing?.created_at || new Date().toISOString(),
@@ -344,31 +557,32 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setAttendance((prev) => {
       const filtered = prev.filter((a) => a.id !== recordId);
       const next = [...filtered, record];
+      attendanceRef.current = next;
       saveToLocalBackup({ attendance: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'attendance', recordId), record);
-      addToast(`Приход зафиксирован в ${time}`, 'success');
-    } catch {
-      addToast('Сохранено локально', 'info');
+    const saved = await writeDocSafe('attendance', recordId, record as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast(`Приход зафиксирован в ${time} и сохранён в базу`, 'success');
+    } else {
+      addToast(`Приход ${time} сохранён в очередь синхронизации`, 'info');
     }
   };
 
   const setDepartureTime = async (employeeId: string, date: string, time: string) => {
     const recordId = `att_${employeeId}_${date}`;
-    const existing = attendance.find((a) => a.employee_id === employeeId && a.date === date);
+    const existing = attendanceRef.current.find((a) => a.id === recordId || (a.employee_id === employeeId && a.date === date));
     const { latenessMinutes, status } = calculateArrivalLateness(
       existing?.arrival_time,
-      settings.work_start
+      settingsRef.current.work_start
     );
 
     const record: AttendanceRecord = {
       id: recordId,
       employee_id: employeeId,
       date,
-      arrival_time: existing?.arrival_time,
+      ...(existing?.arrival_time ? { arrival_time: existing.arrival_time } : {}),
       departure_time: time,
       lateness_minutes: latenessMinutes,
       status: existing?.arrival_time ? status : 'not_marked',
@@ -379,15 +593,16 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setAttendance((prev) => {
       const filtered = prev.filter((a) => a.id !== recordId);
       const next = [...filtered, record];
+      attendanceRef.current = next;
       saveToLocalBackup({ attendance: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'attendance', recordId), record);
-      addToast(`Уход зафиксирован в ${time}`, 'success');
-    } catch {
-      addToast('Сохранено локально', 'info');
+    const saved = await writeDocSafe('attendance', recordId, record as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast(`Уход зафиксирован в ${time} и сохранён в базу`, 'success');
+    } else {
+      addToast(`Уход ${time} сохранён в очередь синхронизации`, 'info');
     }
   };
 
@@ -395,15 +610,16 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const recordId = `att_${employeeId}_${date}`;
     setAttendance((prev) => {
       const next = prev.filter((a) => a.id !== recordId);
+      attendanceRef.current = next;
       saveToLocalBackup({ attendance: next });
       return next;
     });
 
-    try {
-      await deleteDoc(doc(db, 'attendance', recordId));
-      addToast('Отметка успешно сброшена', 'info');
-    } catch {
-      addToast('Сброшено локально', 'info');
+    const deleted = await deleteDocSafe('attendance', recordId);
+    if (deleted) {
+      addToast('Отметка успешно сброшена в базе', 'info');
+    } else {
+      addToast('Сброшено локально (ожидает сеть)', 'info');
     }
   };
 
@@ -414,7 +630,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       lunchStart, 
       undefined, 
       plannedReturn, 
-      settings.standard_lunch_minutes
+      settingsRef.current.standard_lunch_minutes
     );
 
     const record: LunchRecord = {
@@ -423,7 +639,6 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       date,
       lunch_start: lunchStart,
       planned_return: computedPlannedReturn,
-      actual_return: undefined,
       duration_minutes: 0,
       lateness_minutes: 0,
       status: 'in_progress',
@@ -433,27 +648,28 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setLunch((prev) => {
       const next = [...prev, record];
+      lunchRef.current = next;
       saveToLocalBackup({ lunch: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'lunch', lunchId), record);
-      addToast(`Обед начат (${lunchStart})`, 'success');
-    } catch {
-      addToast('Обед сохранён локально', 'info');
+    const saved = await writeDocSafe('lunch', lunchId, record as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast(`Обед начат (${lunchStart}) и сохранён в базу`, 'success');
+    } else {
+      addToast('Обед сохранён в очередь синхронизации', 'info');
     }
   };
 
   const finishLunch = async (lunchId: string, actualReturn: string) => {
-    const existing = lunch.find((l) => l.id === lunchId);
+    const existing = lunchRef.current.find((l) => l.id === lunchId);
     if (!existing) return;
 
     const { durationMinutes, latenessMinutes, status } = calculateLunchDetails(
       existing.lunch_start,
       actualReturn,
       existing.planned_return,
-      settings.standard_lunch_minutes
+      settingsRef.current.standard_lunch_minutes
     );
 
     const record: LunchRecord = {
@@ -467,20 +683,21 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setLunch((prev) => {
       const next = prev.map((l) => (l.id === lunchId ? record : l));
+      lunchRef.current = next;
       saveToLocalBackup({ lunch: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'lunch', lunchId), record);
+    const saved = await writeDocSafe('lunch', lunchId, record as unknown as Record<string, unknown>);
+    if (saved) {
       addToast(`Возврат с обеда зафиксирован (${actualReturn})`, 'success');
-    } catch {
-      addToast('Обновлено локально', 'info');
+    } else {
+      addToast('Обновлено в очереди синхронизации', 'info');
     }
   };
 
   const updateLunch = async (lunchId: string, updates: Partial<LunchRecord>) => {
-    const existing = lunch.find((l) => l.id === lunchId);
+    const existing = lunchRef.current.find((l) => l.id === lunchId);
     if (!existing) return;
 
     const merged = { ...existing, ...updates, updated_at: new Date().toISOString() };
@@ -489,7 +706,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         merged.lunch_start,
         merged.actual_return,
         merged.planned_return,
-        settings.standard_lunch_minutes
+        settingsRef.current.standard_lunch_minutes
       );
       merged.duration_minutes = details.durationMinutes;
       merged.lateness_minutes = details.latenessMinutes;
@@ -498,30 +715,32 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setLunch((prev) => {
       const next = prev.map((l) => (l.id === lunchId ? merged : l));
+      lunchRef.current = next;
       saveToLocalBackup({ lunch: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'lunch', lunchId), merged);
-      addToast('Запись обеда обновлена', 'success');
-    } catch {
-      addToast('Обновлено локально', 'info');
+    const saved = await writeDocSafe('lunch', lunchId, merged as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast('Запись обеда обновлена в базе', 'success');
+    } else {
+      addToast('Обновлено в очереди синхронизации', 'info');
     }
   };
 
   const deleteLunch = async (lunchId: string) => {
     setLunch((prev) => {
       const next = prev.filter((l) => l.id !== lunchId);
+      lunchRef.current = next;
       saveToLocalBackup({ lunch: next });
       return next;
     });
 
-    try {
-      await deleteDoc(doc(db, 'lunch', lunchId));
+    const deleted = await deleteDocSafe('lunch', lunchId);
+    if (deleted) {
       addToast('Запись обеда успешно удалена', 'info');
-    } catch {
-      addToast('Удалено локально', 'info');
+    } else {
+      addToast('Удалено локально (ожидает сеть)', 'info');
     }
   };
 
@@ -533,7 +752,6 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       employee_id: employeeId,
       date,
       break_start: breakStart,
-      break_end: undefined,
       duration_minutes: 0,
       status: 'in_progress',
       created_at: new Date().toISOString(),
@@ -542,20 +760,21 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setBreaks((prev) => {
       const next = [...prev, record];
+      breaksRef.current = next;
       saveToLocalBackup({ breaks: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'breaks', breakId), record);
-      addToast(`Отдых начат (${breakStart})`, 'success');
-    } catch {
-      addToast('Отдых сохранён локально', 'info');
+    const saved = await writeDocSafe('breaks', breakId, record as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast(`Отдых начат (${breakStart}) и сохранён в базу`, 'success');
+    } else {
+      addToast('Отдых сохранён в очередь синхронизации', 'info');
     }
   };
 
   const finishBreak = async (breakId: string, breakEnd: string) => {
-    const existing = breaks.find((b) => b.id === breakId);
+    const existing = breaksRef.current.find((b) => b.id === breakId);
     if (!existing) return;
 
     const duration = calculateDuration(existing.break_start, breakEnd);
@@ -569,20 +788,21 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setBreaks((prev) => {
       const next = prev.map((b) => (b.id === breakId ? record : b));
+      breaksRef.current = next;
       saveToLocalBackup({ breaks: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'breaks', breakId), record);
+    const saved = await writeDocSafe('breaks', breakId, record as unknown as Record<string, unknown>);
+    if (saved) {
       addToast(`Отдых завершён (${duration} мин)`, 'success');
-    } catch {
-      addToast('Обновлено локально', 'info');
+    } else {
+      addToast('Обновлено в очереди синхронизации', 'info');
     }
   };
 
   const updateBreak = async (breakId: string, updates: Partial<BreakRecord>) => {
-    const existing = breaks.find((b) => b.id === breakId);
+    const existing = breaksRef.current.find((b) => b.id === breakId);
     if (!existing) return;
 
     const merged = { ...existing, ...updates, updated_at: new Date().toISOString() };
@@ -593,30 +813,32 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setBreaks((prev) => {
       const next = prev.map((b) => (b.id === breakId ? merged : b));
+      breaksRef.current = next;
       saveToLocalBackup({ breaks: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'breaks', breakId), merged);
-      addToast('Запись отдыха обновлена', 'success');
-    } catch {
-      addToast('Обновлено локально', 'info');
+    const saved = await writeDocSafe('breaks', breakId, merged as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast('Запись отдыха обновлена в базе', 'success');
+    } else {
+      addToast('Обновлено в очереди синхронизации', 'info');
     }
   };
 
   const deleteBreak = async (breakId: string) => {
     setBreaks((prev) => {
       const next = prev.filter((b) => b.id !== breakId);
+      breaksRef.current = next;
       saveToLocalBackup({ breaks: next });
       return next;
     });
 
-    try {
-      await deleteDoc(doc(db, 'breaks', breakId));
+    const deleted = await deleteDocSafe('breaks', breakId);
+    if (deleted) {
       addToast('Запись отдыха успешно удалена', 'info');
-    } catch {
-      addToast('Удалено локально', 'info');
+    } else {
+      addToast('Удалено локально (ожидает сеть)', 'info');
     }
   };
 
@@ -632,7 +854,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const total = cleanAccepted + cleanMissed;
     const callId = `call_${employeeId}_${date}`;
 
-    const existing = calls.find((c) => c.id === callId);
+    const existing = callsRef.current.find((c) => c.id === callId);
     const record: CallRecord = {
       id: callId,
       employee_id: employeeId,
@@ -647,15 +869,16 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCalls((prev) => {
       const filtered = prev.filter((c) => c.id !== callId);
       const next = [...filtered, record];
+      callsRef.current = next;
       saveToLocalBackup({ calls: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'calls', callId), record);
-      addToast('Статистика звонков сохранена', 'success');
-    } catch {
-      addToast('Сохранено локально', 'info');
+    const saved = await writeDocSafe('calls', callId, record as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast('Статистика звонков сохранена в базу', 'success');
+    } else {
+      addToast('Сохранено в очередь синхронизации', 'info');
     }
   };
 
@@ -675,54 +898,58 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setEmployees((prev) => {
       const next = [...prev, newEmp];
+      employeesRef.current = next;
       saveToLocalBackup({ employees: next });
       return next;
     });
 
-    try {
-      await setDoc(doc(db, 'employees', id), newEmp);
-      addToast(`Сотрудник ${cleanName} добавлен`, 'success');
-    } catch {
-      addToast('Добавлен локально', 'info');
+    const saved = await writeDocSafe('employees', id, newEmp as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast(`Сотрудник ${cleanName} добавлен в базу`, 'success');
+    } else {
+      addToast('Добавлен в очередь синхронизации', 'info');
     }
   };
 
   const updateEmployee = async (id: string, updates: Partial<Employee>) => {
+    const current = employeesRef.current.find((e) => e.id === id);
+    if (!current) return;
+
+    const merged: Employee = { ...current, ...updates };
     setEmployees((prev) => {
-      const next = prev.map((e) => (e.id === id ? { ...e, ...updates } : e));
+      const next = prev.map((e) => (e.id === id ? merged : e));
+      employeesRef.current = next;
       saveToLocalBackup({ employees: next });
       return next;
     });
 
-    try {
-      const updated = employees.find((e) => e.id === id);
-      if (updated) {
-        await setDoc(doc(db, 'employees', id), { ...updated, ...updates });
-        addToast('Данные сотрудника обновлены', 'success');
-      }
-    } catch {
-      addToast('Обновлено локально', 'info');
+    const saved = await writeDocSafe('employees', id, merged as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast('Данные сотрудника обновлены в базе', 'success');
+    } else {
+      addToast('Обновлено в очереди синхронизации', 'info');
     }
   };
 
   const deleteEmployee = async (id: string) => {
-    const emp = employees.find((e) => e.id === id);
+    const emp = employeesRef.current.find((e) => e.id === id);
     setEmployees((prev) => {
       const next = prev.filter((e) => e.id !== id);
+      employeesRef.current = next;
       saveToLocalBackup({ employees: next });
       return next;
     });
 
-    try {
-      await deleteDoc(doc(db, 'employees', id));
-      addToast(`Сотрудник ${emp?.name || ''} удален`, 'info');
-    } catch {
-      addToast('Удалено локально', 'info');
+    const deleted = await deleteDocSafe('employees', id);
+    if (deleted) {
+      addToast(`Сотрудник ${emp?.name || ''} удалён из базы`, 'info');
+    } else {
+      addToast('Удалено локально (ожидает сеть)', 'info');
     }
   };
 
   const toggleEmployeeActive = async (id: string) => {
-    const emp = employees.find((e) => e.id === id);
+    const emp = employeesRef.current.find((e) => e.id === id);
     if (!emp) return;
 
     const newStatus = !emp.is_active;
@@ -731,15 +958,16 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const updateSettings = async (newSettings: Partial<SystemSettings>) => {
-    const merged = { ...settings, ...newSettings };
+    const merged = { ...settingsRef.current, ...newSettings };
     setSettings(merged);
+    settingsRef.current = merged;
     saveToLocalBackup({ settings: merged });
 
-    try {
-      await setDoc(doc(db, 'settings', 'general'), merged);
-      addToast('Настройки графика успешно сохранены', 'success');
-    } catch {
-      addToast('Настройки сохранены локально', 'info');
+    const saved = await writeDocSafe('settings', 'general', merged as unknown as Record<string, unknown>);
+    if (saved) {
+      addToast('Настройки графика сохранены в базу', 'success');
+    } else {
+      addToast('Настройки сохранены в очередь синхронизации', 'info');
     }
   };
 
