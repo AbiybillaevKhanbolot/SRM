@@ -98,6 +98,8 @@ interface CrmContextType {
   // Actions
   setArrivalTime: (employeeId: string, date: string, time: string) => Promise<void>;
   setDepartureTime: (employeeId: string, date: string, time: string) => Promise<void>;
+  saveAttendanceRecord: (employeeId: string, date: string, arrivalTime?: string, departureTime?: string, silent?: boolean) => Promise<boolean>;
+  saveAttendanceBatch: (items: Array<{ employeeId: string; date: string; arrivalTime?: string; departureTime?: string }>) => Promise<void>;
   resetAttendance: (employeeId: string, date: string) => Promise<void>;
   startLunch: (employeeId: string, date: string, lunchStart: string, plannedReturn?: string) => Promise<void>;
   finishLunch: (lunchId: string, actualReturn: string) => Promise<void>;
@@ -606,6 +608,77 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
+  const saveAttendanceRecord = async (
+    employeeId: string,
+    date: string,
+    arrivalTime?: string,
+    departureTime?: string,
+    silent: boolean = false
+  ): Promise<boolean> => {
+    const recordId = `att_${employeeId}_${date}`;
+    const existing = attendanceRef.current.find(
+      (a) => a.id === recordId || (a.employee_id === employeeId && a.date === date)
+    );
+    const finalArrival = arrivalTime !== undefined ? arrivalTime : existing?.arrival_time;
+    const finalDeparture = departureTime !== undefined ? departureTime : existing?.departure_time;
+    const { latenessMinutes, status } = calculateArrivalLateness(
+      finalArrival,
+      settingsRef.current.work_start
+    );
+
+    const record: AttendanceRecord = {
+      id: recordId,
+      employee_id: employeeId,
+      date,
+      ...(finalArrival ? { arrival_time: finalArrival } : {}),
+      ...(finalDeparture ? { departure_time: finalDeparture } : {}),
+      lateness_minutes: latenessMinutes,
+      status: finalArrival ? status : 'not_marked',
+      created_at: existing?.created_at || new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    setAttendance((prev) => {
+      const filtered = prev.filter((a) => a.id !== recordId);
+      const next = [...filtered, record];
+      attendanceRef.current = next;
+      saveToLocalBackup({ attendance: next });
+      return next;
+    });
+
+    const saved = await writeDocSafe('attendance', recordId, record as unknown as Record<string, unknown>);
+    if (!silent) {
+      if (saved) {
+        addToast('Данные прихода сохранены в базу', 'success');
+      } else {
+        addToast('Сохранено в очередь синхронизации', 'info');
+      }
+    }
+    return saved;
+  };
+
+  const saveAttendanceBatch = async (
+    items: Array<{ employeeId: string; date: string; arrivalTime?: string; departureTime?: string }>
+  ) => {
+    if (items.length === 0) return;
+    let allSaved = true;
+    for (const item of items) {
+      const ok = await saveAttendanceRecord(
+        item.employeeId,
+        item.date,
+        item.arrivalTime,
+        item.departureTime,
+        true
+      );
+      if (!ok) allSaved = false;
+    }
+    if (allSaved) {
+      addToast(`Сохранено записей в базу: ${items.length}`, 'success');
+    } else {
+      addToast(`Сохранено в очередь синхронизации (${items.length})`, 'info');
+    }
+  };
+
   const resetAttendance = async (employeeId: string, date: string) => {
     const recordId = `att_${employeeId}_${date}`;
     setAttendance((prev) => {
@@ -1000,6 +1073,8 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         closeConfirm,
         setArrivalTime,
         setDepartureTime,
+        saveAttendanceRecord,
+        saveAttendanceBatch,
         resetAttendance,
         startLunch,
         finishLunch,

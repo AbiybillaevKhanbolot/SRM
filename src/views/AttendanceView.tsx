@@ -14,10 +14,19 @@ import {
   Sparkles,
   History,
   CalendarDays,
-  ArrowUpRight
+  ArrowUpRight,
+  Save,
+  Check
 } from 'lucide-react';
 import { useCrm } from '../context/CrmContext';
-import { formatRussianDate } from '../lib/calculations';
+import { calculateArrivalLateness, formatRussianDate } from '../lib/calculations';
+
+interface DraftAttendance {
+  employeeId: string;
+  date: string;
+  arrival_time?: string;
+  departure_time?: string;
+}
 
 export const AttendanceView: React.FC = () => {
   const { 
@@ -26,34 +35,60 @@ export const AttendanceView: React.FC = () => {
     selectedDate, 
     setSelectedDate,
     settings, 
-    setArrivalTime, 
-    setDepartureTime, 
+    saveAttendanceRecord,
+    saveAttendanceBatch,
     resetAttendance,
     openTimePicker,
-    openConfirm 
+    openConfirm,
+    addToast
   } = useCrm();
 
   const [viewMode, setViewMode] = useState<'daily' | 'history'>('daily');
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'on_time' | 'late' | 'not_marked'>('all');
   const [historyDateFilter, setHistoryDateFilter] = useState<string>('');
+  const [draftChanges, setDraftChanges] = useState<Record<string, DraftAttendance>>({});
+  const [isSavingAll, setIsSavingAll] = useState(false);
 
   const activeEmployees = employees.filter((e) => e.is_active);
   const employeeMap = useMemo(() => new Map(employees.map((e) => [e.id, e])), [employees]);
 
-  const attendanceMap = new Map(
-    attendance
-      .filter((a) => a.date === selectedDate)
-      .map((a) => [a.employee_id, a])
+  const attendanceMap = useMemo(
+    () =>
+      new Map(
+        attendance
+          .filter((a) => a.date === selectedDate)
+          .map((a) => [a.employee_id, a])
+      ),
+    [attendance, selectedDate]
   );
+
+  const getDraftKey = (empId: string, date: string) => `${empId}__${date}`;
+
+  // Computes effective row display merging saved DB data + unsaved draft changes
+  const getEffectiveAttendance = (empId: string, date: string, savedRec?: typeof attendance[number]) => {
+    const key = getDraftKey(empId, date);
+    const draft = draftChanges[key];
+    const arrival_time = draft?.arrival_time !== undefined ? draft.arrival_time : savedRec?.arrival_time;
+    const departure_time = draft?.departure_time !== undefined ? draft.departure_time : savedRec?.departure_time;
+    const { latenessMinutes, status } = calculateArrivalLateness(arrival_time, settings.work_start);
+    return {
+      arrival_time,
+      departure_time,
+      lateness_minutes: latenessMinutes,
+      status: arrival_time ? status : 'not_marked',
+      isDirty: Boolean(draft),
+      hasAnyData: Boolean(arrival_time || departure_time),
+    };
+  };
 
   const filteredEmployees = activeEmployees.filter((emp) => {
     const matchesSearch = emp.name.toLowerCase().includes(searchTerm.toLowerCase());
-    const att = attendanceMap.get(emp.id);
-    const status = att ? att.status : 'not_marked';
+    const saved = attendanceMap.get(emp.id);
+    const effective = getEffectiveAttendance(emp.id, selectedDate, saved);
 
     if (statusFilter === 'all') return matchesSearch;
-    return matchesSearch && status === statusFilter;
+    return matchesSearch && effective.status === statusFilter;
   });
 
   // Full persistent attendance history sorted newest first
@@ -64,9 +99,7 @@ export const AttendanceView: React.FC = () => {
         const empName = (emp?.name || '').toLowerCase();
         const matchesSearch = !searchTerm || empName.includes(searchTerm.toLowerCase()) || rec.date.includes(searchTerm);
         const matchesDate = !historyDateFilter || rec.date === historyDateFilter;
-        const matchesStatus =
-          statusFilter === 'all' ||
-          rec.status === statusFilter;
+        const matchesStatus = statusFilter === 'all' || rec.status === statusFilter;
         return matchesSearch && matchesDate && matchesStatus;
       })
       .sort((a, b) => {
@@ -82,7 +115,14 @@ export const AttendanceView: React.FC = () => {
       subtitle: `Дата: ${targetDate} • Начало смены: ${settings.work_start}`,
       initialTime: currentArrival || settings.work_start,
       onSave: (time) => {
-        setArrivalTime(empId, targetDate, time);
+        const key = getDraftKey(empId, targetDate);
+        setDraftChanges((prev) => ({
+          ...prev,
+          [key]: {
+            ...(prev[key] || { employeeId: empId, date: targetDate }),
+            arrival_time: time,
+          },
+        }));
       },
     });
   };
@@ -93,25 +133,102 @@ export const AttendanceView: React.FC = () => {
       subtitle: `Дата: ${targetDate} • Конец смены: ${settings.work_end}`,
       initialTime: currentDeparture || settings.work_end,
       onSave: (time) => {
-        setDepartureTime(empId, targetDate, time);
+        const key = getDraftKey(empId, targetDate);
+        setDraftChanges((prev) => ({
+          ...prev,
+          [key]: {
+            ...(prev[key] || { employeeId: empId, date: targetDate }),
+            departure_time: time,
+          },
+        }));
       },
     });
   };
 
+  const handleSaveRow = async (empId: string, targetDate: string, savedRec?: typeof attendance[number]) => {
+    const key = getDraftKey(empId, targetDate);
+    const effective = getEffectiveAttendance(empId, targetDate, savedRec);
+
+    if (!effective.hasAnyData) {
+      addToast('Сначала выберите время прихода или ухода', 'info');
+      return;
+    }
+
+    await saveAttendanceRecord(empId, targetDate, effective.arrival_time, effective.departure_time);
+
+    setDraftChanges((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  };
+
+  const pendingDraftsList = Object.values(draftChanges);
+
+  const handleSaveAll = async () => {
+    if (pendingDraftsList.length === 0) return;
+    setIsSavingAll(true);
+    try {
+      await saveAttendanceBatch(
+        pendingDraftsList.map((d) => ({
+          employeeId: d.employeeId,
+          date: d.date,
+          arrivalTime: d.arrival_time,
+          departureTime: d.departure_time,
+        }))
+      );
+      setDraftChanges({});
+    } finally {
+      setIsSavingAll(false);
+    }
+  };
+
   const handleReset = (empId: string, empName: string, targetDate: string = selectedDate) => {
+    const key = getDraftKey(empId, targetDate);
+    const hasOnlyDraft = Boolean(draftChanges[key]) && !attendance.some((a) => a.employee_id === empId && a.date === targetDate);
+
+    if (hasOnlyDraft) {
+      setDraftChanges((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      addToast('Черновик очищен', 'info');
+      return;
+    }
+
     openConfirm({
       title: 'Сбросить отметку?',
       message: `Вы действительно хотите сбросить время прихода и ухода для сотрудника ${empName} за ${targetDate}?`,
       confirmText: 'Сбросить',
       onConfirm: () => {
+        setDraftChanges((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
         resetAttendance(empId, targetDate);
       },
     });
   };
 
-  const onTimeCount = Array.from(attendanceMap.values()).filter((a) => a.status === 'on_time').length;
-  const lateCount = Array.from(attendanceMap.values()).filter((a) => a.status === 'late').length;
-  const notMarkedCount = activeEmployees.length - attendanceMap.size;
+  // Compute live summary stats including drafts
+  let onTimeCount = 0;
+  let lateCount = 0;
+  let markedCount = 0;
+  activeEmployees.forEach((emp) => {
+    const eff = getEffectiveAttendance(emp.id, selectedDate, attendanceMap.get(emp.id));
+    if (eff.status === 'on_time') {
+      onTimeCount++;
+      markedCount++;
+    } else if (eff.status === 'late') {
+      lateCount++;
+      markedCount++;
+    } else if (eff.departure_time) {
+      markedCount++;
+    }
+  });
+  const notMarkedCount = Math.max(0, activeEmployees.length - markedCount);
 
   return (
     <div className="space-y-6">
@@ -129,11 +246,11 @@ export const AttendanceView: React.FC = () => {
             </span>
           </h2>
           <p className="text-xs text-slate-400 mt-1 font-medium">
-            Начало смены: <strong className="text-slate-700 font-mono">{settings.work_start}</strong>. Все отметки автоматически сохраняются в облачной базе Firestore.
+            Начало смены: <strong className="text-slate-700 font-mono">{settings.work_start}</strong>. Заполните время и нажмите <strong className="text-slate-700">«Сохранить»</strong> для записи в базу.
           </p>
         </div>
 
-        <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 w-full lg:w-auto">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 w-full lg:w-auto flex-wrap">
           {/* Mode Switcher: Daily vs Full History */}
           <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-full text-xs font-semibold">
             <button
@@ -161,6 +278,27 @@ export const AttendanceView: React.FC = () => {
               <span>История приходов ({attendance.length})</span>
             </button>
           </div>
+
+          {/* Save All Pending Changes Button */}
+          <button
+            type="button"
+            disabled={pendingDraftsList.length === 0 || isSavingAll}
+            onClick={handleSaveAll}
+            className={`px-5 py-2.5 rounded-full text-xs font-bold flex items-center gap-2 transition-all shadow-sm cursor-pointer ${
+              pendingDraftsList.length > 0
+                ? 'bg-[#B9F74A] hover:bg-[#A8F335] text-[#122709] animate-pulse'
+                : 'bg-slate-100 text-slate-400 cursor-default shadow-none'
+            }`}
+          >
+            <Save className="w-4 h-4 stroke-[2.2]" />
+            <span>
+              {isSavingAll
+                ? 'Сохранение...'
+                : pendingDraftsList.length > 0
+                ? `Сохранить изменения (${pendingDraftsList.length})`
+                : 'Всё сохранено'}
+            </span>
+          </button>
 
           {/* Stats Pill Strip */}
           {viewMode === 'daily' && (
@@ -276,7 +414,7 @@ export const AttendanceView: React.FC = () => {
                   <th className="py-4 px-6">Время ухода</th>
                   <th className="py-4 px-6">Опоздание</th>
                   <th className="py-4 px-6">Статус</th>
-                  <th className="py-4 px-6 text-right">Сброс</th>
+                  <th className="py-4 px-6 text-right">Сохранение</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 text-xs font-medium">
@@ -288,15 +426,18 @@ export const AttendanceView: React.FC = () => {
                   </tr>
                 ) : (
                   filteredEmployees.map((emp, index) => {
-                    const att = attendanceMap.get(emp.id);
-                    const isMarked = Boolean(att && att.arrival_time);
-                    const isLate = att?.status === 'late';
-                    const isOnTime = att?.status === 'on_time';
+                    const savedAtt = attendanceMap.get(emp.id);
+                    const eff = getEffectiveAttendance(emp.id, selectedDate, savedAtt);
+                    const isMarked = Boolean(eff.arrival_time);
+                    const isLate = eff.status === 'late';
+                    const isOnTime = eff.status === 'on_time';
 
                     return (
                       <tr 
                         key={emp.id}
-                        className="hover:bg-slate-50/70 transition-colors group"
+                        className={`transition-colors group ${
+                          eff.isDirty ? 'bg-[#B9F74A]/10 hover:bg-[#B9F74A]/15' : 'hover:bg-slate-50/70'
+                        }`}
                       >
                         {/* Index */}
                         <td className="py-4 px-6 text-center text-slate-300 font-mono text-xs">
@@ -305,7 +446,14 @@ export const AttendanceView: React.FC = () => {
 
                         {/* Employee Name */}
                         <td className="py-4 px-6">
-                          <div className="font-bold text-slate-900 text-sm">{emp.name}</div>
+                          <div className="font-bold text-slate-900 text-sm flex items-center gap-2">
+                            <span>{emp.name}</span>
+                            {eff.isDirty && (
+                              <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full">
+                                не сохранено
+                              </span>
+                            )}
+                          </div>
                           <div className="text-[11px] text-slate-400 font-normal">{emp.position || 'Оператор'}</div>
                         </td>
 
@@ -313,7 +461,7 @@ export const AttendanceView: React.FC = () => {
                         <td className="py-4 px-6">
                           <button
                             type="button"
-                            onClick={() => handlePickArrival(emp.id, emp.name, att?.arrival_time)}
+                            onClick={() => handlePickArrival(emp.id, emp.name, eff.arrival_time)}
                             className={`
                               px-4 py-1.5 rounded-full border text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer
                               ${isMarked
@@ -323,7 +471,7 @@ export const AttendanceView: React.FC = () => {
                             `}
                           >
                             <Clock className="w-3.5 h-3.5 text-slate-500 stroke-[2]" />
-                            <span>{att?.arrival_time || 'Выбрать'}</span>
+                            <span>{eff.arrival_time || 'Выбрать'}</span>
                           </button>
                         </td>
 
@@ -331,17 +479,17 @@ export const AttendanceView: React.FC = () => {
                         <td className="py-4 px-6">
                           <button
                             type="button"
-                            onClick={() => handlePickDeparture(emp.id, emp.name, att?.departure_time)}
+                            onClick={() => handlePickDeparture(emp.id, emp.name, eff.departure_time)}
                             className={`
                               px-4 py-1.5 rounded-full border text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer
-                              ${att?.departure_time
+                              ${eff.departure_time
                                 ? 'bg-slate-900 text-white border-slate-900 hover:bg-slate-800'
                                 : 'bg-white border-slate-200 text-slate-500 hover:border-slate-400 hover:text-slate-900'
                               }
                             `}
                           >
                             <Clock className="w-3.5 h-3.5 stroke-[2]" />
-                            <span>{att?.departure_time || 'Выбрать'}</span>
+                            <span>{eff.departure_time || 'Выбрать'}</span>
                           </button>
                         </td>
 
@@ -349,7 +497,7 @@ export const AttendanceView: React.FC = () => {
                         <td className="py-4 px-6 font-mono">
                           {isLate ? (
                             <span className="font-extrabold text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full">
-                              +{att?.lateness_minutes} мин
+                              +{eff.lateness_minutes} мин
                             </span>
                           ) : isOnTime ? (
                             <span className="text-slate-400 font-normal">0 мин</span>
@@ -368,7 +516,7 @@ export const AttendanceView: React.FC = () => {
                           ) : isLate ? (
                             <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-amber-900 bg-amber-100 px-3 py-1 rounded-full">
                               <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
-                              Опоздал ({att?.lateness_minutes}м)
+                              Опоздал ({eff.lateness_minutes}м)
                             </span>
                           ) : (
                             <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-400 bg-slate-100 px-3 py-1 rounded-full">
@@ -378,18 +526,52 @@ export const AttendanceView: React.FC = () => {
                           )}
                         </td>
 
-                        {/* Reset Action */}
+                        {/* Save + Reset Actions */}
                         <td className="py-4 px-6 text-right">
-                          {att && (
+                          <div className="flex items-center justify-end gap-2">
                             <button
                               type="button"
-                              onClick={() => handleReset(emp.id, emp.name)}
-                              title="Сбросить отметку"
-                              className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-full transition-colors cursor-pointer"
+                              onClick={() => handleSaveRow(emp.id, selectedDate, savedAtt)}
+                              disabled={!eff.hasAnyData}
+                              className={`
+                                px-4 py-1.5 rounded-full text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed
+                                ${eff.isDirty
+                                  ? 'bg-[#122709] hover:bg-[#1C3E0E] text-white shadow-sm animate-bounce'
+                                  : savedAtt
+                                  ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200/70'
+                                  : 'bg-slate-100 text-slate-500'
+                                }
+                              `}
                             >
-                              <RotateCcw className="w-4 h-4 stroke-[2]" />
+                              {eff.isDirty ? (
+                                <>
+                                  <Save className="w-3.5 h-3.5 stroke-[2.2] text-[#B9F74A]" />
+                                  <span>Сохранить</span>
+                                </>
+                              ) : savedAtt ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 stroke-[2.5]" />
+                                  <span>Сохранено</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Save className="w-3.5 h-3.5 stroke-[2]" />
+                                  <span>Сохранить</span>
+                                </>
+                              )}
                             </button>
-                          )}
+
+                            {(savedAtt || eff.isDirty) && (
+                              <button
+                                type="button"
+                                onClick={() => handleReset(emp.id, emp.name)}
+                                title="Сбросить отметку"
+                                className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-full transition-colors cursor-pointer"
+                              >
+                                <RotateCcw className="w-4 h-4 stroke-[2]" />
+                              </button>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     );
@@ -412,25 +594,26 @@ export const AttendanceView: React.FC = () => {
                   <th className="py-4 px-6">Уход</th>
                   <th className="py-4 px-6">Опоздание</th>
                   <th className="py-4 px-6">Статус</th>
-                  <th className="py-4 px-6 text-right">Действия</th>
+                  <th className="py-4 px-6 text-right">Сохранение</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 text-xs font-medium">
                 {historyRecords.length === 0 ? (
                   <tr>
                     <td colSpan={7} className="py-12 text-center text-slate-400 font-normal">
-                      История приходов пока пуста. Отметьте время прихода во вкладке «За день».
+                      История приходов пока пуста. Отметьте время прихода во вкладке «За день» и нажмите «Сохранить».
                     </td>
                   </tr>
                 ) : (
                   historyRecords.map((rec) => {
                     const emp = employeeMap.get(rec.employee_id);
                     const empName = emp?.name || rec.employee_id;
-                    const isLate = rec.status === 'late';
-                    const isOnTime = rec.status === 'on_time';
+                    const eff = getEffectiveAttendance(rec.employee_id, rec.date, rec);
+                    const isLate = eff.status === 'late';
+                    const isOnTime = eff.status === 'on_time';
 
                     return (
-                      <tr key={rec.id} className="hover:bg-slate-50/70 transition-colors">
+                      <tr key={rec.id} className={`transition-colors ${eff.isDirty ? 'bg-[#B9F74A]/10' : 'hover:bg-slate-50/70'}`}>
                         <td className="py-4 px-6">
                           <button
                             type="button"
@@ -446,35 +629,42 @@ export const AttendanceView: React.FC = () => {
                           </button>
                         </td>
                         <td className="py-4 px-6">
-                          <div className="font-bold text-slate-900 text-sm">{empName}</div>
+                          <div className="font-bold text-slate-900 text-sm flex items-center gap-2">
+                            <span>{empName}</span>
+                            {eff.isDirty && (
+                              <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full">
+                                не сохранено
+                              </span>
+                            )}
+                          </div>
                           <div className="text-[11px] text-slate-400 font-normal">{emp?.position || 'Специалист'}</div>
                         </td>
                         <td className="py-4 px-6">
                           <button
                             type="button"
-                            onClick={() => handlePickArrival(rec.employee_id, empName, rec.arrival_time, rec.date)}
+                            onClick={() => handlePickArrival(rec.employee_id, empName, eff.arrival_time, rec.date)}
                             className="px-3.5 py-1 rounded-full bg-[#B9F74A]/25 border border-[#B9F74A] text-[#122709] font-mono font-bold text-xs cursor-pointer"
                           >
-                            {rec.arrival_time || 'Выбрать'}
+                            {eff.arrival_time || 'Выбрать'}
                           </button>
                         </td>
                         <td className="py-4 px-6">
                           <button
                             type="button"
-                            onClick={() => handlePickDeparture(rec.employee_id, empName, rec.departure_time, rec.date)}
+                            onClick={() => handlePickDeparture(rec.employee_id, empName, eff.departure_time, rec.date)}
                             className={`px-3.5 py-1 rounded-full font-mono font-bold text-xs cursor-pointer ${
-                              rec.departure_time
+                              eff.departure_time
                                 ? 'bg-slate-900 text-white'
                                 : 'bg-white border border-slate-200 text-slate-500'
                             }`}
                           >
-                            {rec.departure_time || 'Выбрать'}
+                            {eff.departure_time || 'Выбрать'}
                           </button>
                         </td>
                         <td className="py-4 px-6 font-mono">
                           {isLate ? (
                             <span className="font-extrabold text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full">
-                              +{rec.lateness_minutes} мин
+                              +{eff.lateness_minutes} мин
                             </span>
                           ) : isOnTime ? (
                             <span className="text-slate-400 font-normal">0 мин</span>
@@ -491,7 +681,7 @@ export const AttendanceView: React.FC = () => {
                           ) : isLate ? (
                             <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-amber-900 bg-amber-100 px-3 py-1 rounded-full">
                               <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
-                              Опоздал ({rec.lateness_minutes}м)
+                              Опоздал ({eff.lateness_minutes}м)
                             </span>
                           ) : (
                             <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-400 bg-slate-100 px-3 py-1 rounded-full">
@@ -501,14 +691,26 @@ export const AttendanceView: React.FC = () => {
                           )}
                         </td>
                         <td className="py-4 px-6 text-right">
-                          <button
-                            type="button"
-                            onClick={() => handleReset(rec.employee_id, empName, rec.date)}
-                            title="Удалить запись"
-                            className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-full transition-colors cursor-pointer"
-                          >
-                            <RotateCcw className="w-4 h-4 stroke-[2]" />
-                          </button>
+                          <div className="flex items-center justify-end gap-2">
+                            {eff.isDirty && (
+                              <button
+                                type="button"
+                                onClick={() => handleSaveRow(rec.employee_id, rec.date, rec)}
+                                className="px-3.5 py-1.5 rounded-full text-xs font-bold bg-[#122709] hover:bg-[#1C3E0E] text-white flex items-center gap-1.5 cursor-pointer"
+                              >
+                                <Save className="w-3.5 h-3.5 text-[#B9F74A]" />
+                                <span>Сохранить</span>
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleReset(rec.employee_id, empName, rec.date)}
+                              title="Удалить запись"
+                              className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-full transition-colors cursor-pointer"
+                            >
+                              <RotateCcw className="w-4 h-4 stroke-[2]" />
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
